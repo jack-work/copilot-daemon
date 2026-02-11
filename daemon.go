@@ -64,6 +64,8 @@ func findNpx() (string, error) {
 }
 
 func runDaemon() error {
+	cfg := loadConfig()
+
 	npx, err := findNpx()
 	if err != nil {
 		return err
@@ -75,9 +77,16 @@ func runDaemon() error {
 	}
 	defer lf.Close()
 
-	// Log to both file and stderr
-	multi := io.MultiWriter(lf, os.Stderr)
-	logger := log.New(multi, "[copilot-daemon] ", log.LstdFlags)
+	// Log only to file — daemon runs headless
+	logger := log.New(lf, "[copilot-daemon] ", log.LstdFlags)
+
+	// Also write to stderr if attached to a terminal (foreground debug)
+	var procWriter io.Writer = lf
+	if fileInfo, _ := os.Stderr.Stat(); fileInfo != nil && fileInfo.Mode()&os.ModeCharDevice != 0 {
+		multi := io.MultiWriter(lf, os.Stderr)
+		logger = log.New(multi, "[copilot-daemon] ", log.LstdFlags)
+		procWriter = multi
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -91,16 +100,30 @@ func runDaemon() error {
 		cancel()
 	}()
 
-	logger.Printf("copilot-daemon %s starting (npx=%s)", version, npx)
+	logger.Printf("copilot-daemon %s starting (npx=%s, port=%d)", version, npx, cfg.Port)
 
 	backoff := initialBackoff
 	for {
+		// Check if port is already in use
+		if isPortInUse(cfg.Port) {
+			if cfg.DoNotKillExisting {
+				logger.Printf("port %d already in use and do_not_kill_existing=true, exiting", cfg.Port)
+				return nil
+			}
+			logger.Printf("port %d in use, killing existing process...", cfg.Port)
+			if err := killPortHolder(cfg.Port); err != nil {
+				logger.Printf("failed to free port: %v", err)
+				// Fall through — copilot-api will fail, we'll retry
+			} else {
+				logger.Printf("port %d freed", cfg.Port)
+			}
+		}
+
 		logger.Println("starting copilot-api...")
 
 		cmd := exec.CommandContext(ctx, npx, "copilot-api@latest", "start")
-		cmd.Stdout = multi
-		cmd.Stderr = multi
-		// Inherit environment so copilot-api can find GitHub auth
+		cmd.Stdout = procWriter
+		cmd.Stderr = procWriter
 		cmd.Env = os.Environ()
 
 		startTime := time.Now()
@@ -128,13 +151,11 @@ func runDaemon() error {
 			return nil
 		}
 
-		// Increase backoff for next failure
 		backoff *= time.Duration(backoffFactor)
 		if backoff > maxBackoff {
 			backoff = maxBackoff
 		}
 
-		// Rotate log between restarts
 		lf.Sync()
 		rotateLog(logFile())
 	}

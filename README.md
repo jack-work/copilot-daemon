@@ -34,13 +34,31 @@ copilot-daemon uninstall
 ## What it does
 
 - Spawns `npx copilot-api@latest start` as a supervised child process
-- Restarts automatically on crash with exponential backoff (2s → 60s cap)
+- On startup, if the port is already in use, **kills the existing holder** and takes over
+- Restarts automatically on crash with exponential backoff (2s -> 60s cap)
 - Resets backoff after 2 minutes of healthy runtime
-- Logs to `<exe-dir>/logs/copilot-daemon.log` with 10MB rotation
+- Runs headless — logs to `<exe-dir>/logs/copilot-daemon.log` with 10MB rotation
+- When run in a terminal (`copilot-daemon start`), also prints to stderr
 - `install` registers a Windows Task Scheduler task that starts on logon
+
+## Configuration
+
+Place a `config.json` next to the executable (optional):
+
+```json
+{
+  "port": 4141,
+  "do_not_kill_existing": false
+}
+```
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `port` | `4141` | Port copilot-api listens on |
+| `do_not_kill_existing` | `false` | If `true`, exit instead of killing an existing process on the port |
 
 ## Build from source
 
 ```powershell
-go build -o copilot-daemon.exe .
+go build -ldflags "-s -w" -o copilot-daemon.exe .
 ```
