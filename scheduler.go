@@ -2,11 +2,10 @@ package main
 
 import (
 	"fmt"
-	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
-	"time"
 )
 
 const taskName = "CopilotAPIDaemon"
@@ -25,14 +24,24 @@ func install() error {
 		return err
 	}
 
+	// Create a VBS launcher next to the exe.
+	// WshShell.Run with window style 0 = completely hidden.
+	// The "True" arg makes VBS wait for the process, so Task Scheduler can track it.
+	vbsPath := filepath.Join(filepath.Dir(exe), "copilot-daemon-launcher.vbs")
+	vbsContent := fmt.Sprintf(
+		"Set WshShell = CreateObject(\"WScript.Shell\")\r\n"+
+			"WshShell.Run \"\"\"%s\"\" start --foreground\", 0, True\r\n",
+		exe,
+	)
+	if err := os.WriteFile(vbsPath, []byte(vbsContent), 0644); err != nil {
+		return fmt.Errorf("write VBS launcher: %w", err)
+	}
+
 	// Remove existing task first (ignore errors)
 	runSchtasks("/delete", "/tn", taskName, "/f")
 
-	// XML task definition gives us full control over restart settings,
-	// which schtasks /create flags don't support.
-	xml := buildTaskXML(exe)
+	xml := buildTaskXML(vbsPath)
 
-	// Write XML to temp file
 	tmpFile, err := os.CreateTemp("", "copilot-daemon-task-*.xml")
 	if err != nil {
 		return fmt.Errorf("create temp file: %w", err)
@@ -45,7 +54,6 @@ func install() error {
 	}
 	tmpFile.Close()
 
-	// Import the task
 	out, err := runSchtasks("/create", "/tn", taskName, "/xml", tmpFile.Name())
 	if err != nil {
 		return fmt.Errorf("register task: %w\n%s", err, out)
@@ -60,13 +68,20 @@ func install() error {
 	}
 
 	fmt.Println("Daemon started.")
-	fmt.Printf("  Logs: %s\n", logFile())
-	fmt.Println("  Port: http://localhost:4141")
+	fmt.Printf("  Logs:   copilot-daemon logs\n")
+	fmt.Printf("  Status: copilot-daemon status\n")
+	fmt.Printf("  Port:   http://localhost:4141\n")
 	return nil
 }
 
 func uninstall() error {
-	// Stop first
+	// Stop via IPC first (graceful)
+	if conn, err := dialDaemon(); err == nil {
+		fmt.Fprintln(conn, "STOP")
+		conn.Close()
+	}
+
+	// Then remove the scheduled task
 	runSchtasks("/end", "/tn", taskName)
 
 	out, err := runSchtasks("/delete", "/tn", taskName, "/f")
@@ -78,36 +93,18 @@ func uninstall() error {
 		return fmt.Errorf("remove task: %w\n%s", err, out)
 	}
 
+	// Clean up VBS launcher
+	exe, _ := selfExe()
+	if exe != "" {
+		os.Remove(filepath.Join(filepath.Dir(exe), "copilot-daemon-launcher.vbs"))
+	}
+
 	fmt.Println("Scheduled task removed:", taskName)
 	return nil
 }
 
 func status() error {
-	// Check scheduled task
-	out, err := runSchtasks("/query", "/tn", taskName, "/fo", "LIST")
-	if err != nil {
-		fmt.Println("Scheduled task: not registered")
-	} else {
-		taskState := "unknown"
-		for _, line := range strings.Split(string(out), "\n") {
-			if strings.HasPrefix(strings.TrimSpace(line), "Status:") {
-				taskState = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "Status:"))
-				break
-			}
-		}
-		fmt.Println("Scheduled task:", taskState)
-	}
-
-	// Check port 4141
-	conn, err := net.DialTimeout("tcp", "localhost:4141", 2*time.Second)
-	if err != nil {
-		fmt.Println("copilot-api:    not reachable on :4141")
-	} else {
-		conn.Close()
-		fmt.Println("copilot-api:    listening on :4141")
-	}
-
-	return nil
+	return queryStatus()
 }
 
 func runSchtasks(args ...string) (string, error) {
@@ -116,7 +113,7 @@ func runSchtasks(args ...string) (string, error) {
 	return string(out), err
 }
 
-func buildTaskXML(exePath string) string {
+func buildTaskXML(launcherPath string) string {
 	user := os.Getenv("USERDOMAIN") + `\` + os.Getenv("USERNAME")
 	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
@@ -157,9 +154,9 @@ func buildTaskXML(exePath string) string {
   </Settings>
   <Actions Context="Author">
     <Exec>
-      <Command>%s</Command>
-      <Arguments>start</Arguments>
+      <Command>wscript.exe</Command>
+      <Arguments>"%s"</Arguments>
     </Exec>
   </Actions>
-</Task>`, user, user, exePath)
+</Task>`, user, user, launcherPath)
 }

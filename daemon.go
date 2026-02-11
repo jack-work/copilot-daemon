@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -18,6 +17,9 @@ const (
 	maxBackoff     = 60 * time.Second
 	backoffFactor  = 2
 	maxLogSize     = 10 * 1024 * 1024 // 10MB
+
+	createNoWindow  = 0x08000000
+	detachedProcess = 0x00000008
 )
 
 func logDir() string {
@@ -52,7 +54,6 @@ func openLog() (*os.File, error) {
 func findNpx() (string, error) {
 	path, err := exec.LookPath("npx")
 	if err != nil {
-		// Try common scoop location
 		home, _ := os.UserHomeDir()
 		scoopNpx := filepath.Join(home, "scoop", "apps", "nodejs", "current", "npx.cmd")
 		if _, serr := os.Stat(scoopNpx); serr == nil {
@@ -61,6 +62,45 @@ func findNpx() (string, error) {
 		return "", fmt.Errorf("npx not found on PATH: %w", err)
 	}
 	return path, nil
+}
+
+// daemonize re-launches this process detached with no console window, then exits.
+func daemonize() error {
+	exe, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("cannot determine own path: %w", err)
+	}
+
+	cmd := exec.Command(exe, "start", "--foreground")
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		CreationFlags: detachedProcess | createNoWindow,
+	}
+	// Pass environment so child can find npx, GitHub auth, etc.
+	cmd.Env = os.Environ()
+
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("failed to start daemon: %w", err)
+	}
+
+	fmt.Printf("Daemon started (PID %d)\n", cmd.Process.Pid)
+	fmt.Println("  Status:  copilot-daemon status")
+	fmt.Println("  Logs:    copilot-daemon logs")
+	fmt.Println("  Stop:    copilot-daemon stop")
+	return nil
+}
+
+// broadcastWriter writes to a log file and broadcasts to IPC log subscribers.
+type broadcastWriter struct {
+	file *os.File
+	ipc  *IPCServer
+}
+
+func (w *broadcastWriter) Write(p []byte) (int, error) {
+	n, err := w.file.Write(p)
+	if w.ipc != nil {
+		w.ipc.BroadcastLog(p)
+	}
+	return n, err
 }
 
 func runDaemon() error {
@@ -77,19 +117,25 @@ func runDaemon() error {
 	}
 	defer lf.Close()
 
-	// Log only to file — daemon runs headless
-	logger := log.New(lf, "[copilot-daemon] ", log.LstdFlags)
-
-	// Also write to stderr if attached to a terminal (foreground debug)
-	var procWriter io.Writer = lf
-	if fileInfo, _ := os.Stderr.Stat(); fileInfo != nil && fileInfo.Mode()&os.ModeCharDevice != 0 {
-		multi := io.MultiWriter(lf, os.Stderr)
-		logger = log.New(multi, "[copilot-daemon] ", log.LstdFlags)
-		procWriter = multi
-	}
-
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// Start IPC server (named pipe)
+	ipc, err := newIPCServer(cfg.Port, cancel)
+	if err != nil {
+		// Log but don't fail — daemon can still work without IPC
+		log.New(lf, "[copilot-daemon] ", log.LstdFlags).Printf("WARNING: IPC pipe unavailable: %v", err)
+	}
+
+	// Writer that goes to file + IPC log subscribers
+	bw := &broadcastWriter{file: lf, ipc: ipc}
+	logger := log.New(bw, "[copilot-daemon] ", log.LstdFlags)
+
+	if ipc != nil {
+		ipc.logger = logger
+		go ipc.Serve(ctx)
+		defer ipc.Close()
+	}
 
 	// Handle shutdown signals
 	sigCh := make(chan os.Signal, 1)
@@ -100,7 +146,7 @@ func runDaemon() error {
 		cancel()
 	}()
 
-	logger.Printf("copilot-daemon %s starting (npx=%s, port=%d)", version, npx, cfg.Port)
+	logger.Printf("copilot-daemon %s starting (npx=%s, port=%d, pipe=%s)", version, npx, cfg.Port, pipeName)
 
 	backoff := initialBackoff
 	for {
@@ -113,7 +159,6 @@ func runDaemon() error {
 			logger.Printf("port %d in use, killing existing process...", cfg.Port)
 			if err := killPortHolder(cfg.Port); err != nil {
 				logger.Printf("failed to free port: %v", err)
-				// Fall through — copilot-api will fail, we'll retry
 			} else {
 				logger.Printf("port %d freed", cfg.Port)
 			}
@@ -121,25 +166,48 @@ func runDaemon() error {
 
 		logger.Println("starting copilot-api...")
 
-		cmd := exec.CommandContext(ctx, npx, "copilot-api@latest", "start")
-		cmd.Stdout = procWriter
-		cmd.Stderr = procWriter
+		cmd := exec.Command(npx, "copilot-api@latest", "start")
+		cmd.Stdout = bw
+		cmd.Stderr = bw
 		cmd.Env = os.Environ()
-
-		startTime := time.Now()
-		err := cmd.Run()
-
-		if ctx.Err() != nil {
-			logger.Println("shutdown complete")
-			return nil
+		// Child process also gets no window
+		cmd.SysProcAttr = &syscall.SysProcAttr{
+			CreationFlags: createNoWindow,
 		}
 
-		elapsed := time.Since(startTime)
-		logger.Printf("copilot-api exited after %v: %v", elapsed.Round(time.Second), err)
+		startTime := time.Now()
 
-		// Reset backoff if process ran for a while (was healthy)
-		if elapsed > 2*time.Minute {
-			backoff = initialBackoff
+		if startErr := cmd.Start(); startErr != nil {
+			logger.Printf("failed to start copilot-api: %v", startErr)
+		} else {
+			// Wait for either the process to exit or context cancellation (stop).
+			done := make(chan error, 1)
+			go func() { done <- cmd.Wait() }()
+
+			select {
+			case err = <-done:
+				// Process exited on its own
+			case <-ctx.Done():
+				// Shutdown requested — kill entire process tree
+				logger.Println("killing copilot-api process tree...")
+				killTree := exec.Command("taskkill", "/t", "/f", "/pid", fmt.Sprintf("%d", cmd.Process.Pid))
+				killTree.Run()
+				<-done
+				logger.Println("shutdown complete")
+				return nil
+			}
+
+			if ctx.Err() != nil {
+				logger.Println("shutdown complete")
+				return nil
+			}
+
+			elapsed := time.Since(startTime)
+			logger.Printf("copilot-api exited after %v: %v", elapsed.Round(time.Second), err)
+
+			if elapsed > 2*time.Minute {
+				backoff = initialBackoff
+			}
 		}
 
 		logger.Printf("restarting in %v...", backoff)

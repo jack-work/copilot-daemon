@@ -18,28 +18,35 @@ scoop install copilot-daemon
 ## Usage
 
 ```powershell
-# Register as scheduled task + start immediately
+# Register as startup task + start immediately
 copilot-daemon install
 
-# Check if running
+# Start in background (no window, detaches immediately)
+copilot-daemon start
+
+# Query daemon status via named pipe
 copilot-daemon status
 
-# Run in foreground (for debugging)
-copilot-daemon start
+# Tail live log stream via named pipe
+copilot-daemon logs
+
+# Gracefully stop (kills entire process tree)
+copilot-daemon stop
 
 # Remove scheduled task
 copilot-daemon uninstall
 ```
 
-## What it does
+## How it works
 
 - Spawns `npx copilot-api@latest start` as a supervised child process
-- On startup, if the port is already in use, **kills the existing holder** and takes over
-- Restarts automatically on crash with exponential backoff (2s -> 60s cap)
-- Resets backoff after 2 minutes of healthy runtime
-- Runs headless — logs to `<exe-dir>/logs/copilot-daemon.log` with 10MB rotation
-- When run in a terminal (`copilot-daemon start`), also prints to stderr
-- `install` registers a Windows Task Scheduler task that starts on logon
+- **No visible window** — `start` detaches with `DETACHED_PROCESS | CREATE_NO_WINDOW`; Task Scheduler uses a VBS launcher with hidden window style
+- **Named pipe IPC** (`\\.\pipe\copilot-daemon`) for `status`, `stop`, and `logs` commands
+- `logs` streams live output via the named pipe — connect from any terminal
+- On port conflict, kills the existing holder and takes over (configurable)
+- Auto-restarts on crash with exponential backoff (2s -> 60s cap, resets after 2min healthy)
+- Logs to `<exe-dir>/logs/copilot-daemon.log` with 10MB rotation
+- `stop` uses `taskkill /t /f` to kill the entire npx/node process tree
 
 ## Configuration
 
